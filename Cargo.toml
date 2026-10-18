@@ -1,0 +1,91 @@
+[package]
+edition      = "2024"
+name         = "esp32c3-proj"
+rust-version = "1.88"
+version      = "0.1.0"
+default-run  = "motor-driver"
+
+[[bin]]
+name = "motor-driver"
+path = "./src/bin/motor_driver.rs"
+test = false
+
+[[bin]]
+name = "idle-diagnostic"
+path = "./src/bin/idle_diagnostic.rs"
+test = false
+
+[[bin]]
+name = "esp32c3-proj"
+path = "./src/bin/main.rs"
+test = false
+required-features = ["wifi-demo"]
+
+[[test]]
+harness = false
+name    = "hello_test"
+
+[lib]
+test = false
+
+[features]
+default = ["motor-http"]
+motor-http = ["dep:esp-alloc", "dep:esp-radio", "dep:esp-rtos", "dep:esp-radio-rtos-driver", "dep:smoltcp"]
+wifi-demo = ["dep:esp-alloc", "dep:esp-radio", "dep:esp-rtos", "dep:smoltcp", "dep:panic-halt"]
+
+[dependencies]
+motor-control = { path = "motor-control" }
+esp-hal = { version = "~1.0", features = ["esp32c3", "unstable"] }
+
+esp-rtos = { version = "0.2.0", optional = true, features = [
+  "esp-alloc",
+  "esp-radio",
+  "esp32c3",
+] }
+
+esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c3"] }
+
+critical-section = "1.2.0"
+embedded-io = "0.7.1"
+esp-alloc = { version = "0.9.0", optional = true }
+esp-radio-rtos-driver = { version = "0.2.0", optional = true }
+esp-println = { version = "0.16.1", features = ["esp32c3"] }
+esp-radio = { version = "0.17.0", optional = true, features = [
+  "esp-alloc",
+  "esp32c3",
+  "smoltcp",
+  "unstable",
+  "wifi",
+] }
+smoltcp = { version = "0.12.0", optional = true, default-features = false, features = [
+  "alloc",
+  "medium-ethernet",
+  "multicast",
+  "proto-dhcpv4",
+  "proto-dns",
+  "proto-ipv4",
+  "socket-dns",
+  "socket-dhcpv4",
+  "socket-icmp",
+  "socket-raw",
+  "socket-tcp",
+  "socket-udp",
+] }
+heapless = "0.8"
+embedded-hal = "1.0"
+panic-halt = { version = "0.2", optional = true }
+
+[dev-dependencies]
+embedded-test = "0.7.0"
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units    = 1
+debug            = 2
+debug-assertions = false
+incremental      = false
+lto              = 'fat'
+opt-level        = 's'
+overflow-checks  = false
