@@ -14,7 +14,7 @@
 
 ## 硬件与资料
 
-完整硬件清单、接线表、模块参数/原理图和供电照片见 **[hardware/](hardware/README.md)**。
+四项核心硬件的清单、接线表和模块参数/原理图见 **[hardware/](hardware/README.md)**。
 
 | ESP32-C3 | 驱动板 / 编码器 |
 |---|---|
