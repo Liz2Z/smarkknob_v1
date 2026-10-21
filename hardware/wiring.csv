@@ -1,0 +1,17 @@
+net,from,to,notes
+IN1,ESP32-C3 GPIO4,DRV8313 IN1,PWM
+IN2,ESP32-C3 GPIO5,DRV8313 IN2,PWM
+IN3,ESP32-C3 GPIO6,DRV8313 IN3,PWM
+EN,ESP32-C3 GPIO7,DRV8313 EN,High enables outputs
+nFAULT,DRV8313 nFT,ESP32-C3 GPIO10,Active low; input pull-up
+SDA,ESP32-C3 GPIO20,AS5600 P1 SDA,I2C
+SCL,ESP32-C3 GPIO21,AS5600 P1 SCL,I2C
+3V3,ESP32-C3 3V3,AS5600 P1 VCC,3.3V configuration
+nSLEEP,ESP32-C3 3V3,DRV8313 nSP,Active-low input held high
+nRESET,ESP32-C3 3V3,DRV8313 nRT,Active-low input held high
+GND,ESP32-C3 GND,DRV8313 GND / AS5600 P1 GND / 12V supply negative,Common ground
+VM,12V supply positive,DRV8313 VM / +,External motor power only
+USB,Computer USB,ESP32-C3 USB,Logic power and flashing
+U,DRV8313 M1,Motor phase U,Phase label is a project convention
+V,DRV8313 M2,Motor phase V,Phase label is a project convention
+W,DRV8313 M3,Motor phase W,Phase label is a project convention
