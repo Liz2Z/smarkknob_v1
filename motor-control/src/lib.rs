@@ -3,7 +3,11 @@
 use core::f32::consts::TAU;
 
 pub mod api;
+pub mod decimal;
 pub mod encoder;
+pub mod haptic;
+pub mod trace;
+mod trig;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Parameters {
@@ -78,9 +82,15 @@ fn phase_duties(elapsed_us: u64, reverse: bool, volts: f32, period_us: u64) -> [
 }
 
 fn angle_duties(angle: f32, volts: f32) -> [u32; 3] {
+    // Equal phase duties are exact at zero voltage. Avoid three software sine
+    // evaluations on the C3 while a haptic well is at rest; the bridge remains
+    // enabled by the caller, retaining the existing passive damping behavior.
+    if volts == 0.0 {
+        return [PWM_PERIOD / 2; 3];
+    }
     let amplitude = volts / SUPPLY_VOLTS;
     [0.0, -TAU / 3.0, TAU / 3.0].map(|offset| {
-        let duty = (0.5 + amplitude * libm::sinf(angle + offset)) * PWM_PERIOD as f32;
+        let duty = (0.5 + amplitude * trig::sin(angle + offset)) * PWM_PERIOD as f32;
         // Never pass negative or above-period compare values to LEDC.
         (duty + 0.5).clamp(0.0, (PWM_PERIOD - 1) as f32) as u32
     })
@@ -93,6 +103,7 @@ pub struct Run {
     reverse: bool,
     configured_reverse: bool,
     heartbeat: Option<u64>,
+    autonomous: bool,
     parameters: Parameters,
     angle: f32,
     applied_volts: f32,
@@ -109,6 +120,7 @@ impl Run {
         self.last_update = now_us;
         self.reverse = reverse;
         self.heartbeat = None;
+        self.autonomous = false;
         self.angle = 0.0;
         self.applied_volts = 0.0;
         self.applied_hz = 0.0;
@@ -123,7 +135,20 @@ impl Run {
         true
     }
 
+    /// Board-owned operation: network clients configure it, not sustain it.
+    /// Control-gap, explicit-stop and caller-owned duration limits still apply.
+    pub fn start_autonomous(&mut self, now_us: u64) -> bool {
+        if !self.start_continuous(now_us) {
+            return false;
+        }
+        self.autonomous = true;
+        true
+    }
+
     pub fn keep_alive(&mut self, now_us: u64) -> bool {
+        if self.autonomous {
+            return self.active();
+        }
         let Some(last) = self.heartbeat else {
             return false;
         };
@@ -189,7 +214,7 @@ impl Run {
         let previous_update = self.last_update;
         self.last_update = now_us;
         if let Some(heartbeat) = self.heartbeat {
-            if now_us < heartbeat || now_us - heartbeat >= KEEPALIVE_US {
+            if !self.autonomous && (now_us < heartbeat || now_us - heartbeat >= KEEPALIVE_US) {
                 self.stop();
                 return None;
             }
@@ -221,6 +246,27 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autonomous_run_survives_no_client_and_still_obeys_stop_and_control_gap() {
+        let mut run = Run::default();
+        assert!(run.start_autonomous(0));
+        for now in (0..=3_000_000).step_by(1_000) {
+            assert!(run.update(now).is_some());
+        }
+        assert!(run.active() && run.is_continuous());
+        assert!(!run.start_autonomous(3_000_000));
+        run.stop();
+        assert_eq!(run.update(3_001_000), None);
+        run.start_autonomous(4_000_000);
+        assert_eq!(run.update(4_020_001), None);
+        // The existing USB continuous command still opts into its own lease.
+        run.start_continuous(5_000_000);
+        for now in (5_000_000..5_500_000).step_by(1_000) {
+            assert!(run.update(now).is_some());
+        }
+        assert_eq!(run.update(5_500_000), None);
+    }
 
     #[test]
     fn idle_until_command_and_explicit_stop() {

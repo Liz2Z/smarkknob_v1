@@ -1,0 +1,16 @@
+<div id="wiringPage" hidden>
+ <p class="wire-intro">旋转查看 2804、电机驱动与磁编码器。点击焊盘检查接线，展开编码器查看磁环与轴孔。</p>
+ <div class="wire-configuration"><div class="wire-modes" aria-label="装配布局"><button data-wire-layout="assembled" aria-pressed="true">装配总览</button><button data-wire-layout="exploded" aria-pressed="false">编码器展开</button></div><div class="wire-facts"><span>模块包络 <b id="wireEnvelope">—</b></span><span>视图线路约 <b id="wireLength">—</b></span><span class="wire-estimate">尺寸含估计</span><span id="wireLayoutLabel" hidden>装配总览</span></div></div>
+ <div class="wire-layout">
+  <div class="wire-stage" id="wireStage"><canvas id="wiringCanvas" tabindex="0" aria-label="智能旋钮三维装配模型，拖动旋转、滚轮缩放、右键平移，点击焊盘查看接线"></canvas><div id="wireLoading" class="wire-loading">正在创建三维视图…</div>
+   <div class="wire-toolbar" aria-label="3D 视角控制"><button data-wire-view="iso" aria-pressed="true">立体</button><button data-wire-view="top" aria-pressed="false">俯视</button><button data-wire-view="front" aria-pressed="false">正面</button><button data-wire-view="back" aria-pressed="false">背面</button><button data-wire-view="side" aria-pressed="false">侧面</button><button id="wireReset" title="复位视角">复位</button><span></span><button id="wireFullscreen" title="全屏显示">全屏 ↗</button></div>
+   <div class="wire-key"><span><i></i>绝缘导线 Ø 0.7mm</span><span>正交走线 · 90°</span><span>5mm 网格</span><span>单位 mm</span></div><div class="wire-hint">拖动旋转 · 滚轮缩放 · 右键平移 · 点击焊盘查看连接<br>模块摆放为示意，保持现有 GPIO；此视图不控制电机</div>
+  </div>
+  <aside class="wire-inspector"><div class="wire-inspector-head"><span>ASSEMBLY / 01</span><h2>接线与结构</h2><p>C3 / DRV8313 / 2804 / AS5600</p></div>
+   <div class="wire-display"><label><input type="checkbox" id="wireLabels" checked>引脚标注</label><label><input type="checkbox" id="wireWires" checked>显示连线</label><label><input type="checkbox" id="wireGrid" checked>参考网格</label><label><input type="checkbox" id="wireGlass">透视模块</label></div>
+   <div class="wire-net-title"><span>选择线路</span><button id="wireAll">显示全部</button></div><div id="wireNets"></div>
+   <div class="wire-detail"><label class="label" for="wireModule">查看模块</label><select id="wireModule" class="wire-select"><option value="">请选择模块</option></select><label class="label" for="wirePin">查看引脚</label><select id="wirePin" class="wire-select"><option value="">请选择引脚</option></select><h2 id="wireInspectTitle">全部接线</h2><div id="wireDetail"></div><button id="wireFocus" disabled>聚焦模块</button></div>
+  </aside>
+ </div>
+ <details class="wire-evidence"><summary>尺寸依据与接线说明 <span>引脚按图核对 · 部分尺寸待实测</span></summary><div id="wireNotes"></div><div class="wire-table-wrap"><table class="wire-table"><thead><tr><th>ESP32-C3</th><th>DRV8313 / 编码器</th></tr></thead><tbody><tr><td>GPIO4 / 5 / 6</td><td>IN1 / IN2 / IN3</td></tr><tr><td>GPIO7 / GPIO10</td><td>EN / nFT</td></tr><tr><td>GPIO20 / GPIO21</td><td>AS5600 P1：SDA / SCL</td></tr><tr><td>3V3</td><td>AS5600 P1 VCC、nSP、nRT</td></tr><tr><td>GND</td><td>驱动板、编码器、电源负极共地</td></tr><tr><td>USB 独立供电</td><td>12V 只接驱动电源；M1/M2/M3 接电机</td></tr></tbody></table></div><p>模型部件细节为照片与尺寸图的近似，主控/驱动板的焊盘位置、安装槽和元件尺寸尚未实测。模型净距检查不代表电路或加工验证。线长不含接头、弯曲和预留，展开图不可用于直接裁线。接线前断开 USB 和 12V。</p></details>
+</div>

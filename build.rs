@@ -1,9 +1,34 @@
 fn main() {
     wifi_config();
+    panel_assets();
     linker_be_nice();
     println!("cargo:rustc-link-arg-tests=-Tembedded-test.x");
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
+}
+
+// Bundle shared viewer resources into the existing single HTTP page. Static
+// data stays in Flash, with no new sockets, heap copies, or CDN dependencies.
+fn panel_assets() {
+    fn asset(path: &str) -> String {
+        println!("cargo:rerun-if-changed={path}");
+        std::fs::read_to_string(path).expect("read management panel asset")
+    }
+    let template = asset("src/bin/motor_http/panel.html");
+    assert_eq!(template.matches("<!--WIRING_SECTION-->").count(), 1);
+    let page = template.replace("<!--WIRING_SECTION-->", &asset("admin/wiring/section.html"));
+    let mut embedded = String::from("<style>");
+    embedded.push_str(&asset("admin/wiring/viewer.css"));
+    embedded.push_str("</style><script type=\"application/json\" id=\"wiring-design\">");
+    embedded.push_str(&asset("admin/wiring/design.json").replace('<', "\\u003c"));
+    embedded.push_str("</script><script>");
+    embedded.push_str(&asset("admin/wiring/viewer.bundle.js"));
+    embedded.push_str("</script>");
+    assert_eq!(page.matches("<!--WIRING_ASSETS-->").count(), 1);
+    let output =
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("motor_panel.html");
+    std::fs::write(output, page.replace("<!--WIRING_ASSETS-->", &embedded))
+        .expect("write bundled management panel");
 }
 
 fn wifi_config() {

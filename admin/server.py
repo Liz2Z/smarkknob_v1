@@ -16,6 +16,24 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_STATE = ROOT.parent / ".local" / "motor-admin.json"
 
 
+def render_panel():
+    """Serve the same offline viewer assets bundled by the firmware build."""
+    folder = ROOT / "wiring"
+    template = (ROOT / "index.html").read_text()
+    if template.count("<!--WIRING_SECTION-->") != 1:
+        raise RuntimeError("management panel section marker missing or duplicated")
+    template = template.replace("<!--WIRING_SECTION-->", (folder / "section.html").read_text())
+    css = (folder / "viewer.css").read_text()
+    design = (folder / "design.json").read_text().replace("<", "\\u003c")
+    script = (folder / "viewer.bundle.js").read_text()
+    assets = (f"<style>{css}</style>"
+              f'<script type="application/json" id="wiring-design">{design}</script>'
+              f"<script>{script}</script>")
+    if template.count("<!--WIRING_ASSETS-->") != 1:
+        raise RuntimeError("management panel asset marker missing or duplicated")
+    return template.replace("<!--WIRING_ASSETS-->", assets).encode()
+
+
 class ApiError(Exception):
     def __init__(self, status, message):
         super().__init__(message)
@@ -138,7 +156,7 @@ def make_handler(controller):
             try:
                 self.check_origin()
                 if self.path == "/":
-                    self.reply(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
+                    self.reply(200, render_panel(), "text/html; charset=utf-8")
                 elif self.path == "/api/settings":
                     self.reply(200, controller.settings())
                 elif self.path == "/api/status":
@@ -171,14 +189,24 @@ def make_handler(controller):
                     result = controller.set_device(data["device_url"])
                 elif self.path == "/api/config":
                     result = controller.forward(self.path, validate_parameters(data))
-                elif self.path == "/api/start":
+                elif self.path == "/api/haptic/config":
+                    if set(data) != {"mode", "strength", "step_deg"}:
+                        raise ApiError(400, "需要 mode、strength、step_deg")
+                    if data["mode"] not in ("free", "detents", "switch", "selector", "spring", "ratchet_forward", "ratchet_reverse"):
+                        raise ApiError(400, "未知旋钮模式")
+                    for key, low, high in (("strength", 0.1, 1), ("step_deg", 5, 90)):
+                        value = data[key]
+                        if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not low <= value <= high:
+                            raise ApiError(400, "旋钮参数超出范围")
+                    result = controller.forward(self.path, data)
+                elif self.path in ("/api/start", "/api/haptic/start"):
                     if set(data) - {"duration_ms"}:
                         raise ApiError(400, "未知启动参数")
                     duration = data.get("duration_ms", 3000)
                     if isinstance(duration, bool) or not isinstance(duration, int) or not 0 <= duration <= 30000:
                         raise ApiError(400, "duration_ms 须为 0–30000 的整数")
                     result = controller.forward(self.path, {"duration_ms": duration})
-                elif self.path in ("/api/stop", "/api/keepalive"):
+                elif self.path in ("/api/stop", "/api/keepalive", "/api/haptic/calibrate"):
                     if data:
                         raise ApiError(400, "此接口不接受额外参数")
                     result = controller.forward(self.path, {})

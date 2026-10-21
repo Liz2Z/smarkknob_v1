@@ -1,4 +1,11 @@
-//! Read-only AS5600 register decoding. No configuration or OTP writes.
+//! AS5600 decoding and volatile feedback configuration. Never writes OTP.
+
+/// CONF: SF=11 (2x, 0.286ms), nominal power, watchdog off while controlling.
+/// Preserve factory/reserved bits, output format, hysteresis and FTH. The worker
+/// restores the original complete CONF when idle; no BURN command is used.
+pub const fn feedback_configuration(original: u16) -> u16 {
+    (original & !0x2303) | 0x0300
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Reading {
@@ -68,6 +75,15 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feedback_configuration_preserves_all_unrelated_bits() {
+        for original in 0..=u16::MAX {
+            let c = feedback_configuration(original);
+            assert_eq!(c & 0x2303, 0x0300);
+            assert_eq!(c & !0x2303, original & !0x2303);
+        }
+    }
 
     #[test]
     fn angle_is_big_endian_12_bit_and_wraps_below_360() {

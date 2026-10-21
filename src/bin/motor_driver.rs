@@ -7,6 +7,8 @@ extern crate alloc;
 mod as5600;
 #[cfg(feature = "motor-http")]
 mod motor_http;
+#[cfg(feature = "motor-http")]
+mod motor_trace;
 
 use core::fmt::Write as _;
 use esp_hal::{
@@ -24,7 +26,38 @@ use esp_hal::{
     time::{Instant, Rate},
     usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagTx},
 };
-use motor_control::Run;
+use motor_control::{Run, decimal::Fixed};
+
+// A panic in any RTOS worker must prevent main from re-enabling the bridge.
+static EMERGENCY_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "motor-http")]
+static STATUS_FORMAT_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "motor-http")]
+static NETWORK_POLL_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "motor-http")]
+static CONTROL_WORK_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "motor-http")]
+fn record_max(counter: &core::sync::atomic::AtomicU32, elapsed: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    critical_section::with(|_| {
+        counter.store(
+            counter
+                .load(Relaxed)
+                .max(elapsed.min(u32::MAX as u64) as u32),
+            Relaxed,
+        );
+    });
+}
+
+#[cfg(feature = "motor-http")]
+fn reset_timing() {
+    use core::sync::atomic::Ordering::Relaxed;
+    STATUS_FORMAT_MAX_US.store(0, Relaxed);
+    NETWORK_POLL_MAX_US.store(0, Relaxed);
+    CONTROL_WORK_MAX_US.store(0, Relaxed);
+}
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -44,10 +77,16 @@ impl Driver<'_> {
     }
 
     fn apply(&mut self, duties: [u32; 3]) {
-        for (phase, duty) in self.phases.iter().zip(duties) {
-            phase.set_duty_hw(duty);
-        }
-        self.enable.set_high();
+        critical_section::with(|_| {
+            if EMERGENCY_STOP.load(core::sync::atomic::Ordering::Acquire) {
+                self.stop();
+                return;
+            }
+            for (phase, duty) in self.phases.iter().zip(duties) {
+                phase.set_duty_hw(duty);
+            }
+            self.enable.set_high();
+        });
     }
 
     /// Count actual GPIO pad transitions while the bridge stays disabled.
@@ -94,37 +133,41 @@ fn http_status(
     run: &Run,
     fault: bool,
     encoder: &as5600::Encoder,
+    haptic: &motor_control::haptic::Haptics,
     control_max_gap_us: u64,
 ) -> motor_http::Response {
-    let parameters = run.parameters();
-    let mut body = heapless::String::new();
-    let mode = if run.is_continuous() {
+    let mode = if haptic.active() {
+        "haptic"
+    } else if run.is_continuous() {
         "continuous"
     } else if run.active() {
         "pulse"
     } else {
         "stopped"
     };
-    let direction = if run.reverse_setting() {
-        "reverse"
-    } else {
-        "forward"
-    };
-    let _ = write!(
-        body,
-        "{{\"running\":{},\"fault\":{},\"mode\":\"{}\",\"direction\":\"{}\",\"voltage\":{:.3},\"frequency_hz\":{:.3},\"lease_ms\":500,\"uptime_ms\":{},\"control_max_gap_us\":{}",
-        run.active(),
+    motor_http::Response::status(motor_http::Status {
+        running: run.active() || haptic.active(),
         fault,
         mode,
-        direction,
-        parameters.voltage,
-        parameters.frequency_hz,
-        now_us() / 1000,
-        control_max_gap_us
-    );
-    encoder.append_json(&mut body, now_us());
-    let _ = body.push('}');
-    motor_http::Response::json(200, body)
+        reverse: run.reverse_setting(),
+        parameters: run.parameters(),
+        captured_us: now_us(),
+        control_max_gap_us,
+        encoder: encoder.telemetry(),
+        knob: motor_http::KnobStatus {
+            mode: haptic.config.mode.name(),
+            active: haptic.active(),
+            calibrated: haptic.calibrated(),
+            phase: haptic.phase(),
+            position: haptic.position,
+            angle_deg: haptic.angle_deg(),
+            strength: haptic.config.strength,
+            step_deg: haptic.config.step_deg,
+            voltage: haptic.commanded_volts,
+            error: haptic.error,
+            sensor_direction: haptic.sensor_direction(),
+        },
+    })
 }
 
 #[esp_hal::main]
@@ -186,9 +229,10 @@ fn main() -> ! {
     #[cfg(feature = "motor-http")]
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
     #[cfg(feature = "motor-http")]
-    // Leave headroom for the encoder task stack and Wi-Fi association/RX
-    // allocations. With 32KiB ordinary heap only ~2KiB remained at boot.
-    esp_alloc::heap_allocator!(size: 48 * 1024);
+    // Include the dedicated HTTP worker stack and preserve Wi-Fi RX/TX
+    // headroom. At 48KiB only 2.8KiB remained after worker initialization,
+    // causing packet drops/timeouts even while control timing was healthy.
+    esp_alloc::heap_allocator!(size: 64 * 1024);
     #[cfg(feature = "motor-http")]
     let radio = {
         let timg = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
@@ -198,11 +242,17 @@ fn main() -> ! {
         esp_radio::init().unwrap()
     };
     #[cfg(feature = "motor-http")]
-    let mut server = motor_http::Server::new(&radio, peripherals.WIFI, now_us());
+    let mut server = motor_http::Server::new(
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(radio)),
+        peripherals.WIFI,
+        now_us(),
+    );
     #[cfg(feature = "motor-http")]
     let main_thread = esp_rtos::CurrentThreadHandle::get();
     #[cfg(feature = "motor-http")]
     main_thread.set_priority(1);
+    #[cfg(feature = "motor-http")]
+    let mut realtime = false;
     #[cfg(feature = "motor-http")]
     let encoder = &as5600::ENCODER;
     #[cfg(feature = "motor-http")]
@@ -210,7 +260,7 @@ fn main() -> ! {
         let bus = esp_hal::i2c::master::I2c::new(
             peripherals.I2C0,
             esp_hal::i2c::master::Config::default()
-                .with_frequency(Rate::from_khz(100))
+                .with_frequency(Rate::from_khz(400))
                 .with_timeout(esp_hal::i2c::master::BusTimeout::BusCycles(1000))
                 .with_software_timeout(esp_hal::i2c::master::SoftwareTimeout::Transaction(
                     esp_hal::time::Duration::from_millis(20),
@@ -227,6 +277,8 @@ fn main() -> ! {
     #[cfg(feature = "motor-http")]
     let mut http_deadline: Option<u64> = None;
     let mut run = Run::default();
+    #[cfg(feature = "motor-http")]
+    let mut haptic = motor_control::haptic::Haptics::default();
     let mut line = [0u8; 32];
     let mut length = 0;
     let mut overflow = false;
@@ -249,6 +301,8 @@ fn main() -> ! {
             let Ok(byte) = rx.read_byte() else { break };
             if byte == 3 || byte == 27 {
                 run.stop();
+                #[cfg(feature = "motor-http")]
+                haptic.stop("");
                 driver.stop();
                 armed_at = None;
                 length = 0;
@@ -261,6 +315,13 @@ fn main() -> ! {
                 let command = &line[..length];
                 let now = now_us();
                 #[cfg(feature = "motor-http")]
+                if !matches!(command, b"?" | b"status" | b"encoder" | b"net") && haptic.active() {
+                    haptic.stop("serial_override");
+                    driver.stop();
+                    http_owned = false;
+                    http_deadline = None;
+                }
+                #[cfg(feature = "motor-http")]
                 if matches!(command, b"arm" | b"s" | b"stop" | b"diag" | b"faultwire") {
                     http_owned = false;
                     http_deadline = None;
@@ -269,12 +330,16 @@ fn main() -> ! {
                     reply(&mut tx, b"ERROR command too long; STOPPED\r\n");
                 } else if command == b"arm" {
                     run.stop();
+                    #[cfg(feature = "motor-http")]
+                    haptic.stop("");
                     driver.stop();
                     armed_at = Some(now);
                     reply(&mut tx, b"ARMED 10s; c continuous; f/r pulse; s stop\r\n");
                 } else if command == b"f" || command == b"r" || command == b"c" {
                     if fault.is_low() {
                         run.stop();
+                        #[cfg(feature = "motor-http")]
+                        haptic.stop("");
                         driver.stop();
                         armed_at = None;
                         reply(&mut tx, b"FAULT LOW STOPPED; GPIO10/nFT asserted\r\n");
@@ -286,6 +351,7 @@ fn main() -> ! {
                         #[cfg(feature = "motor-http")]
                         {
                             control_max_gap_us = 0;
+                            reset_timing();
                             control_last_us = None;
                         }
                         // The power-mode transition may take time. Start the
@@ -297,8 +363,9 @@ fn main() -> ! {
                             let mut message = heapless::String::<96>::new();
                             let _ = write!(
                                 message,
-                                "RUN continuous {:.2}V {:.2}Hz; keepalive 500ms\r\n",
-                                parameters.voltage, parameters.frequency_hz
+                                "RUN continuous {}V {}Hz; keepalive 500ms\r\n",
+                                Fixed::<2>(parameters.voltage),
+                                Fixed::<2>(parameters.frequency_hz)
                             );
                             reply(&mut tx, message.as_bytes());
                         } else {
@@ -320,12 +387,16 @@ fn main() -> ! {
                         reply(&mut tx, b"ALIVE\r\n");
                     } else {
                         run.stop();
+                        #[cfg(feature = "motor-http")]
+                        haptic.stop("");
                         driver.stop();
                         armed_at = None;
                         reply(&mut tx, b"STOPPED no live continuous lease\r\n");
                     }
                 } else if command == b"s" || command == b"stop" {
                     run.stop();
+                    #[cfg(feature = "motor-http")]
+                    haptic.stop("");
                     driver.stop();
                     armed_at = None;
                     reply(&mut tx, b"STOPPED\r\n");
@@ -333,6 +404,8 @@ fn main() -> ! {
                     // Passive input bias test only. Do not assume a HIGH
                     // level means the open-drain nFAULT is actually wired.
                     run.stop();
+                    #[cfg(feature = "motor-http")]
+                    haptic.stop("");
                     driver.stop();
                     armed_at = None;
                     fault.apply_config(&InputConfig::default().with_pull(Pull::Up));
@@ -367,6 +440,8 @@ fn main() -> ! {
                     );
                 } else if command == b"diag" {
                     run.stop();
+                    #[cfg(feature = "motor-http")]
+                    haptic.stop("");
                     armed_at = None;
                     let (edges, fault_low_samples) = driver.diagnose_pwm(&fault);
                     let mut message = heapless::String::<96>::new();
@@ -382,8 +457,9 @@ fn main() -> ! {
                         let mut message = heapless::String::<96>::new();
                         let _ = write!(
                             message,
-                            "STATUS continuous {:.2}V {:.2}Hz\r\n",
-                            parameters.voltage, parameters.frequency_hz
+                            "STATUS continuous {}V {}Hz\r\n",
+                            Fixed::<2>(parameters.voltage),
+                            Fixed::<2>(parameters.frequency_hz)
                         );
                         reply(&mut tx, message.as_bytes());
                     } else {
@@ -430,6 +506,8 @@ fn main() -> ! {
                     }
                 } else {
                     run.stop();
+                    #[cfg(feature = "motor-http")]
+                    haptic.stop("");
                     driver.stop();
                     armed_at = None;
                     reply(&mut tx, b"UNKNOWN; stopped. arm then c or f/r; s stop\r\n");
@@ -442,25 +520,70 @@ fn main() -> ! {
             } else {
                 overflow = true;
                 run.stop();
+                #[cfg(feature = "motor-http")]
+                haptic.stop("");
                 driver.stop();
                 armed_at = None;
             }
         }
 
-        if run.active() && fault.is_low() {
+        if (run.active() || {
+            #[cfg(feature = "motor-http")]
+            {
+                haptic.active()
+            }
+            #[cfg(not(feature = "motor-http"))]
+            {
+                false
+            }
+        }) && (fault.is_low() || EMERGENCY_STOP.load(core::sync::atomic::Ordering::Acquire))
+        {
             let elapsed = run.elapsed_us(now_us()).unwrap_or(0);
             run.stop();
+            #[cfg(feature = "motor-http")]
+            haptic.stop(
+                if EMERGENCY_STOP.load(core::sync::atomic::Ordering::Acquire) {
+                    "internal_error"
+                } else {
+                    ""
+                },
+            );
             driver.stop();
             armed_at = None;
-            let mut message = heapless::String::<96>::new();
-            let _ = write!(message, "FAULT LOW STOPPED t={}us; GPIO10/nFT\r\n", elapsed);
-            reply(&mut tx, message.as_bytes());
+            if EMERGENCY_STOP.load(core::sync::atomic::Ordering::Acquire) {
+                reply(&mut tx, b"INTERNAL ERROR STOPPED; restart required\r\n");
+            } else {
+                let mut message = heapless::String::<96>::new();
+                let _ = write!(message, "FAULT LOW STOPPED t={}us; GPIO10/nFT\r\n", elapsed);
+                reply(&mut tx, message.as_bytes());
+            }
         }
 
         let now = now_us();
-        if now - last_tick >= 500 {
+        // AS5600 acquisition and force control both target 1kHz. Sleep leaves
+        // CPU time for I2C while retaining the legacy 2kHz open-loop schedule.
+        let control_period_us = {
+            #[cfg(feature = "motor-http")]
+            {
+                if haptic.active() { 1000 } else { 500 }
+            }
+            #[cfg(not(feature = "motor-http"))]
+            {
+                500
+            }
+        };
+        if now - last_tick >= control_period_us {
             last_tick = now;
-            let was_active = run.active();
+            let was_active = run.active() || {
+                #[cfg(feature = "motor-http")]
+                {
+                    haptic.active()
+                }
+                #[cfg(not(feature = "motor-http"))]
+                {
+                    false
+                }
+            };
             #[cfg(feature = "motor-http")]
             if was_active {
                 if let Some(previous) = control_last_us {
@@ -470,52 +593,100 @@ fn main() -> ! {
             } else {
                 control_last_us = None;
             }
-            if let Some(duties) = run.update(now) {
+            #[cfg(feature = "motor-http")]
+            let control_started = now_us();
+            #[cfg(feature = "motor-http")]
+            let mut feedback_sample = None;
+            #[cfg(feature = "motor-http")]
+            let output = if haptic.active() {
+                let sample = encoder.snapshot();
+                feedback_sample = Some(sample);
+                haptic.update(now_us(), sample)
+            } else {
+                run.update(now)
+            };
+            #[cfg(not(feature = "motor-http"))]
+            let output = run.update(now);
+            if let Some(duties) = output {
                 driver.apply(duties);
             } else {
                 driver.stop();
-                if was_active {
-                    reply(&mut tx, b"STOPPED timeout, keepalive or update gap\r\n");
+                if was_active && !run.active() && {
+                    #[cfg(feature = "motor-http")]
+                    {
+                        !haptic.active()
+                    }
+                    #[cfg(not(feature = "motor-http"))]
+                    {
+                        true
+                    }
+                } {
+                    reply(&mut tx, b"STOPPED duration, control gap or feedback\r\n");
                 }
+            }
+            // Apply PWM before trace conversions/copying. Its timestamp now
+            // describes the actual actuation boundary, rather than an earlier
+            // command that still has diagnostics work ahead of it.
+            #[cfg(feature = "motor-http")]
+            if let Some(sample) = feedback_sample {
+                let applied_at = now_us();
+                motor_trace::record(
+                    applied_at,
+                    sample,
+                    &haptic,
+                    applied_at.saturating_sub(control_started),
+                );
+            }
+            #[cfg(feature = "motor-http")]
+            if was_active {
+                record_max(
+                    &CONTROL_WORK_MAX_US,
+                    now_us().saturating_sub(control_started),
+                );
             }
         }
 
         #[cfg(feature = "motor-http")]
         {
-            if !run.is_continuous() {
+            if !run.is_continuous() && !haptic.active() {
                 http_owned = false;
                 http_deadline = None;
             }
             if http_owned && http_deadline.is_some_and(|deadline| now >= deadline) {
                 run.stop();
+                #[cfg(feature = "motor-http")]
+                haptic.stop("");
                 driver.stop();
                 http_owned = false;
                 http_deadline = None;
             }
-            let action = server.poll(now, !run.active());
+            let poll_started = now_us();
+            let action = server.poll(now, true);
+            record_max(&NETWORK_POLL_MAX_US, now_us().saturating_sub(poll_started));
             if server.changed {
-                if http_owned {
-                    run.stop();
-                    driver.stop();
-                    http_owned = false;
-                    http_deadline = None;
-                }
                 let mut message = heapless::String::<96>::new();
                 if let Some(ip) = server.address {
                     let _ = write!(message, "HTTP http://{}/\r\n", ip);
                 } else {
-                    let _ = message.push_str("HTTP WiFi disconnected; stopped\r\n");
+                    let _ =
+                        message.push_str("HTTP WiFi disconnected; board operation continues\r\n");
                 }
                 reply(&mut tx, message.as_bytes());
             }
             if let Some((connection, action)) = action {
                 use motor_control::api::Action;
-                let now = now_us();
                 let response = match action {
                     Action::Status => {
-                        http_status(&run, fault.is_low(), encoder, control_max_gap_us)
+                        http_status(&run, fault.is_low(), encoder, &haptic, control_max_gap_us)
                     }
                     Action::Configure(parameters, reverse) => {
+                        if haptic.active() {
+                            haptic.stop("");
+                            driver.stop();
+                            http_owned = false;
+                            http_deadline = None;
+                        }
+
                         if reverse.is_some_and(|value| run.configure_direction(value)) {
                             driver.stop();
                             armed_at = None;
@@ -523,51 +694,92 @@ fn main() -> ! {
                             http_deadline = None;
                         }
                         run.configure(parameters);
-                        http_status(&run, fault.is_low(), encoder, control_max_gap_us)
+                        http_status(&run, fault.is_low(), encoder, &haptic, control_max_gap_us)
                     }
                     Action::Start(duration) => {
-                        if fault.is_low() {
+                        if EMERGENCY_STOP.load(core::sync::atomic::Ordering::Acquire) {
+                            motor_http::Response::error(409, "internal error; restart board")
+                        } else if fault.is_low() {
                             motor_http::Response::error(409, "driver fault; output disabled")
-                        } else if run.active() {
+                        } else if run.active() || haptic.active() {
                             motor_http::Response::error(409, "motor already running")
                         } else {
                             armed_at = None;
                             server.set_motor_running(true);
                             control_max_gap_us = 0;
+                            reset_timing();
                             control_last_us = None;
                             let now = now_us();
-                            run.start_continuous(now);
+                            run.start_autonomous(now);
                             http_owned = true;
                             http_deadline = if duration == 0 {
                                 None
                             } else {
                                 Some(now + duration as u64 * 1000)
                             };
-                            http_status(&run, false, encoder, control_max_gap_us)
+                            http_status(&run, false, encoder, &haptic, control_max_gap_us)
                         }
                     }
                     Action::Stop => {
                         run.stop();
+                        #[cfg(feature = "motor-http")]
+                        haptic.stop("");
                         driver.stop();
                         armed_at = None;
                         http_owned = false;
                         http_deadline = None;
-                        http_status(&run, fault.is_low(), encoder, control_max_gap_us)
+                        http_status(&run, fault.is_low(), encoder, &haptic, control_max_gap_us)
                     }
                     Action::Keepalive => {
-                        if http_owned && run.keep_alive(now) {
-                            http_status(&run, fault.is_low(), encoder, control_max_gap_us)
+                        // Compatibility endpoint for older pages. Operation is
+                        // owned by the board and never depends on this request.
+                        http_status(&run, fault.is_low(), encoder, &haptic, control_max_gap_us)
+                    }
+                    Action::HapticConfigure(config) => {
+                        run.stop();
+                        haptic.configure(config);
+                        driver.stop();
+                        armed_at = None;
+                        http_owned = false;
+                        http_deadline = None;
+                        http_status(&run, fault.is_low(), encoder, &haptic, control_max_gap_us)
+                    }
+                    Action::HapticCalibrate | Action::HapticStart(_) => {
+                        if EMERGENCY_STOP.load(core::sync::atomic::Ordering::Acquire) {
+                            motor_http::Response::error(409, "internal error; restart board")
+                        } else if fault.is_low() {
+                            motor_http::Response::error(409, "driver fault; output disabled")
+                        } else if run.active() || haptic.active() {
+                            motor_http::Response::error(409, "stop before switching modes")
                         } else {
-                            if http_owned {
-                                run.stop();
-                                driver.stop();
-                                http_owned = false;
-                                http_deadline = None;
+                            let calibrate = matches!(action, Action::HapticCalibrate);
+                            server.set_motor_running(true);
+                            let now = now_us();
+                            let accepted = if calibrate {
+                                haptic.calibrate(now)
+                            } else {
+                                haptic.start(now)
+                            };
+                            if accepted {
+                                motor_trace::reset();
+                                armed_at = None;
+                                http_owned = true;
+                                control_max_gap_us = 0;
+                                reset_timing();
+                                control_last_us = None;
+                                http_deadline = match action {
+                                    Action::HapticStart(0) => None,
+                                    Action::HapticStart(ms) => Some(now + ms as u64 * 1000),
+                                    _ => Some(now + 6_000_000),
+                                };
+                                encoder.set_running(true);
+                                http_status(&run, false, encoder, &haptic, control_max_gap_us)
+                            } else {
+                                motor_http::Response::error(409, "calibrate before enabling force")
                             }
-                            motor_http::Response::error(409, "no active HTTP motor session")
                         }
                     }
-                    Action::Page => unreachable!(),
+                    Action::Page | Action::HapticTrace => unreachable!(),
                 };
                 server.respond(connection, response);
             }
@@ -575,10 +787,29 @@ fn main() -> ! {
             // All stop paths have disabled EN before returning to the idle
             // modem profile. Blocking here lets the RTOS run its WFI idle task
             // instead of spinning USB/TCP polls as fast as the CPU permits.
-            server.set_motor_running(run.active());
-            encoder.set_running(run.active());
-            let deadline_us = if run.active() {
-                last_tick.saturating_add(500)
+            let active = run.active() || haptic.active();
+            server.set_motor_running(active);
+            encoder.set_running(active);
+            let force_control = haptic.active();
+            if realtime != force_control {
+                main_thread.set_priority(if force_control {
+                    as5600::ACTIVE_PRIORITY
+                } else {
+                    1
+                });
+                realtime = force_control;
+            }
+            let deadline_us = if active {
+                let nominal = last_tick.saturating_add(control_period_us);
+                if force_control {
+                    // Heavy HTTP formatting can consume the entire nominal
+                    // period. Reserve a real sleep window for Wi-Fi instead of
+                    // repeatedly requesting an already-expired deadline at a
+                    // higher priority and starving dashboard transport.
+                    nominal.max(now_us().saturating_add(500))
+                } else {
+                    nominal
+                }
             } else {
                 now_us().saturating_add(5_000)
             };
@@ -590,8 +821,9 @@ fn main() -> ! {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-    // SAFETY: execution never returns to main; reclaim only the fixed EN pin
-    // to shut down the bridge. No interrupt handler owns or writes GPIO7.
+    EMERGENCY_STOP.store(true, core::sync::atomic::Ordering::Release);
+    // SAFETY: terminal emergency path reclaims only EN; the latch prevents
+    // another RTOS task from subsequently turning the bridge back on.
     let pin = unsafe { AnyPin::steal(7) };
     let mut enable = Output::new(pin, Level::Low, OutputConfig::default());
     enable.set_low();

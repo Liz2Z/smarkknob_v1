@@ -84,6 +84,16 @@ class AdminTests(unittest.TestCase):
         self.assertFalse(data["running"])
         self.assertEqual(self.request("/api/status")[1]["frequency_hz"], 10)
 
+    def test_haptic_proxy_forwards_form_and_validates_parameters(self):
+        data = {"mode": "switch", "strength": .4, "step_deg": 60}
+        self.assertEqual(self.request("/api/haptic/config", data)[0], 200)
+        self.assertEqual(self.calls[-1], ("/api/haptic/config", {"mode": ["switch"], "strength": ["0.4"], "step_deg": ["60"]}))
+        for invalid in ({**data, "strength": True}, {**data, "mode": "unknown"}, {**data, "step_deg": 4}):
+            self.assertEqual(self.request("/api/haptic/config", invalid)[0], 400)
+        self.assertEqual(self.request("/api/haptic/calibrate", {})[0], 200)
+        self.assertEqual(self.calls[-1], ("/api/haptic/calibrate", {}))
+        self.assertEqual(self.request("/api/haptic/start", {"duration_ms": 3000})[0], 200)
+
     def test_encoder_diagnostics_preserve_missing_and_live_samples(self):
         self.state["encoder"] = {"online": False, "angle_deg": None, "raw_angle": None, "magnet": "unknown", "error": "nack"}
         status, data = self.request("/api/status")

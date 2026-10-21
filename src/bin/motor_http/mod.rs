@@ -8,9 +8,13 @@ use smoltcp::{
     time::Instant,
     wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address},
 };
+mod status;
+mod worker;
+pub use status::{KnobStatus, Status};
+pub use worker::Server;
 
 include!(concat!(env!("OUT_DIR"), "/wifi_config.rs"));
-const PAGE: &[u8] = include_bytes!("panel.html");
+const PAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/motor_panel.html"));
 
 pub struct Response {
     header: heapless::String<256>,
@@ -22,11 +26,28 @@ pub struct Response {
 #[allow(clippy::large_enum_variant)]
 enum Body {
     Static(&'static [u8]),
-    Json(heapless::String<768>),
+    Json(heapless::String<1024>),
+    Status(Status),
+    Owned(Vec<u8>),
 }
 
 impl Response {
-    pub fn json(status: u16, body: heapless::String<768>) -> Self {
+    pub fn status(status: Status) -> Self {
+        Self {
+            header: heapless::String::new(),
+            body: Body::Status(status),
+            sent: 0,
+        }
+    }
+
+    fn prepare(self) -> Self {
+        if let Body::Status(status) = &self.body {
+            Self::json(200, status.json())
+        } else {
+            self
+        }
+    }
+    pub fn json(status: u16, body: heapless::String<1024>) -> Self {
         Self::new(status, "application/json", Body::Json(body))
     }
 
@@ -40,6 +61,8 @@ impl Response {
         let len = match &body {
             Body::Static(bytes) => bytes.len(),
             Body::Json(s) => s.len(),
+            Body::Owned(bytes) => bytes.len(),
+            Body::Status(_) => unreachable!("deferred status must be prepared by network worker"),
         };
         let mut header = heapless::String::new();
         let _ = write!(
@@ -58,6 +81,8 @@ impl Response {
         match &self.body {
             Body::Static(bytes) => bytes,
             Body::Json(s) => s.as_bytes(),
+            Body::Owned(bytes) => bytes,
+            Body::Status(_) => unreachable!("deferred status must be prepared by network worker"),
         }
     }
 }
@@ -69,7 +94,7 @@ struct Connection {
     touched: u64,
 }
 
-pub struct Server<'a> {
+struct Transport<'a> {
     controller: WifiController<'a>,
     device: WifiDevice<'a>,
     iface: Interface,
@@ -83,7 +108,7 @@ pub struct Server<'a> {
     motor_running: bool,
 }
 
-impl<'a> Server<'a> {
+impl<'a> Transport<'a> {
     pub fn new(
         radio: &'a esp_radio::Controller<'a>,
         wifi: esp_hal::peripherals::WIFI<'a>,
@@ -141,7 +166,7 @@ impl<'a> Server<'a> {
     }
 
     /// Keep the modem asleep between DTIM beacons while idle, but avoid adding
-    /// modem-sleep latency to the 500ms motor lease. Call before starting PWM.
+    /// modem-sleep latency to administration while the motor runs.
     pub fn set_motor_running(&mut self, running: bool) {
         if self.motor_running == running {
             return;
@@ -265,6 +290,14 @@ impl<'a> Server<'a> {
                         connection.response =
                             Some(Response::new(200, "text/html", Body::Static(PAGE)))
                     }
+                    Ok(Some(Action::HapticTrace)) => {
+                        connection.response = Some(match crate::motor_trace::snapshot() {
+                            Some(bytes) => {
+                                Response::new(200, "application/octet-stream", Body::Owned(bytes))
+                            }
+                            None => Response::error(503, "trace memory unavailable"),
+                        });
+                    }
                     Ok(Some(action)) => return Some((index, action)),
                     Ok(None) if !socket.may_recv() => socket.abort(),
                     Ok(None) => {}
@@ -281,6 +314,6 @@ impl<'a> Server<'a> {
     }
 
     pub fn respond(&mut self, index: usize, response: Response) {
-        self.connections[index].response = Some(response);
+        self.connections[index].response = Some(response.prepare());
     }
 }

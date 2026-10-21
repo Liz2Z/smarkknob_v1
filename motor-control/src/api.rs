@@ -30,6 +30,10 @@ pub enum Action {
     Start(u32),
     Stop,
     Keepalive,
+    HapticConfigure(crate::haptic::Config),
+    HapticCalibrate,
+    HapticStart(u32),
+    HapticTrace,
 }
 
 pub fn parse(bytes: &[u8]) -> Result<Option<Action>, Error> {
@@ -98,6 +102,7 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Action>, Error> {
     match (method, path) {
         ("GET", "/") => Ok(Some(Action::Page)),
         ("GET", "/api/status") => Ok(Some(Action::Status)),
+        ("GET", "/api/haptic/trace") => Ok(Some(Action::HapticTrace)),
         ("POST", "/api/config") if form => {
             let mut voltage = None;
             let mut frequency = None;
@@ -146,9 +151,60 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Action>, Error> {
         }
         ("POST", "/api/stop") if body.is_empty() => Ok(Some(Action::Stop)),
         ("POST", "/api/keepalive") if body.is_empty() => Ok(Some(Action::Keepalive)),
+        ("POST", "/api/haptic/config") if form => {
+            let (mut mode, mut strength, mut step) = (None, None, None);
+            for part in body.split('&') {
+                let (key, value) = part.split_once('=').ok_or(Error::BadRequest)?;
+                match key {
+                    "mode" if mode.is_none() => {
+                        mode = Some(crate::haptic::Mode::parse(value).ok_or(Error::BadRequest)?)
+                    }
+                    "strength" if strength.is_none() => {
+                        strength = Some(value.parse::<f32>().map_err(|_| Error::BadRequest)?)
+                    }
+                    "step_deg" if step.is_none() => {
+                        step = Some(value.parse::<f32>().map_err(|_| Error::BadRequest)?)
+                    }
+                    _ => return Err(Error::BadRequest),
+                }
+            }
+            let config = crate::haptic::Config {
+                mode: mode.ok_or(Error::BadRequest)?,
+                strength: strength.ok_or(Error::BadRequest)?,
+                step_deg: step.ok_or(Error::BadRequest)?,
+            };
+            if !config.valid() {
+                return Err(Error::BadRequest);
+            }
+            Ok(Some(Action::HapticConfigure(config)))
+        }
+        ("POST", "/api/haptic/calibrate") if body.is_empty() => Ok(Some(Action::HapticCalibrate)),
+        ("POST", "/api/haptic/start") if body.is_empty() || form => {
+            let duration = if body.is_empty() {
+                3000
+            } else {
+                body.strip_prefix("duration_ms=")
+                    .ok_or(Error::BadRequest)?
+                    .parse::<u32>()
+                    .map_err(|_| Error::BadRequest)?
+            };
+            if duration > 30_000 {
+                return Err(Error::BadRequest);
+            }
+            Ok(Some(Action::HapticStart(duration)))
+        }
         (
             "GET" | "POST",
-            "/api/config" | "/api/start" | "/api/stop" | "/api/keepalive" | "/api/status" | "/",
+            "/api/config"
+            | "/api/start"
+            | "/api/stop"
+            | "/api/keepalive"
+            | "/api/status"
+            | "/"
+            | "/api/haptic/config"
+            | "/api/haptic/calibrate"
+            | "/api/haptic/start"
+            | "/api/haptic/trace",
         ) => Err(Error::MethodNotAllowed),
         ("GET" | "POST", _) => Err(Error::NotFound),
         _ => Err(Error::MethodNotAllowed),
@@ -159,6 +215,67 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Action>, Error> {
 mod tests {
     extern crate std;
     use super::*;
+
+    #[test]
+    fn feedback_trace_is_read_only() {
+        assert_eq!(
+            parse(b"GET /api/haptic/trace HTTP/1.1\r\n\r\n"),
+            Ok(Some(Action::HapticTrace))
+        );
+        assert_eq!(
+            parse(b"POST /api/haptic/trace HTTP/1.1\r\n\r\n"),
+            Err(Error::MethodNotAllowed)
+        );
+    }
+
+    #[test]
+    fn haptic_routes_validate_modes_force_and_duration() {
+        fn request(path: &str, body: &str) -> Result<Option<Action>, Error> {
+            let text = std::format!(
+                "POST {} HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+                path,
+                body.len(),
+                body
+            );
+            parse(text.as_bytes())
+        }
+        for mode in [
+            "free",
+            "detents",
+            "switch",
+            "selector",
+            "spring",
+            "ratchet_forward",
+            "ratchet_reverse",
+        ] {
+            assert!(matches!(
+                request(
+                    "/api/haptic/config",
+                    &std::format!("mode={mode}&strength=0.4&step_deg=15")
+                ),
+                Ok(Some(Action::HapticConfigure(_)))
+            ));
+        }
+        for body in [
+            "mode=invalid&strength=0.4&step_deg=15",
+            "mode=switch&strength=NaN&step_deg=15",
+            "mode=spring&strength=1.01&step_deg=15",
+            "mode=spring&strength=0.4&step_deg=4",
+            "mode=free&mode=free&strength=0.4&step_deg=15",
+        ] {
+            assert_eq!(request("/api/haptic/config", body), Err(Error::BadRequest));
+        }
+        assert_eq!(
+            request("/api/haptic/calibrate", ""),
+            Ok(Some(Action::HapticCalibrate))
+        );
+        assert!(request("/api/haptic/calibrate", "force=1").is_err());
+        assert_eq!(
+            request("/api/haptic/start", "duration_ms=0"),
+            Ok(Some(Action::HapticStart(0)))
+        );
+        assert!(request("/api/haptic/start", "duration_ms=30001").is_err());
+    }
 
     #[test]
     fn split_body_is_not_applied_until_complete() {

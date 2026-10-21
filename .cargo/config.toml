@@ -3,6 +3,8 @@ runner = "espflash flash --monitor --port /dev/cu.usbmodem21201"
 
 [env]
 DEFMT_LOG="info"
+# Bound equal-priority control/encoder time slicing to 1ms instead of 10ms.
+ESP_RTOS_CONFIG_TICK_RATE_HZ="1000"
 
 [build]
 rustflags = [

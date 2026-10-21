@@ -1,17 +1,17 @@
 use alloc::boxed::Box;
-use core::{
-    cell::RefCell,
-    ffi::c_void,
-    fmt::Write,
-    future::Future,
-    task::{Context, Poll, Waker},
-};
+use core::{cell::RefCell, ffi::c_void, fmt::Write};
 use esp_hal::{
-    Async, Blocking,
+    Blocking,
     i2c::master::{Error, I2c},
     time::{Duration, Instant},
 };
-use motor_control::encoder::{Reading, Snapshot};
+use motor_control::encoder::{Reading, Snapshot, feedback_configuration};
+
+// Keep feedback above the Wi-Fi SDK work: the lower priority allowed 5.7ms
+// update gaps during hand movement. Network requests are now independent of
+// motor lifetime, so delayed dashboard responses cannot terminate a session.
+// Both feedback tasks still sleep to leave radio/background work CPU time.
+pub const ACTIVE_PRIORITY: usize = 30;
 
 #[derive(Clone, Copy)]
 struct Data {
@@ -19,11 +19,15 @@ struct Data {
     running: bool,
     sequence: u32,
     errors: u32,
+    configuration: Option<u16>,
 }
 
 pub struct Encoder {
     data: critical_section::Mutex<RefCell<Data>>,
 }
+
+#[derive(Clone, Copy)]
+pub struct Telemetry(Data);
 
 pub static ENCODER: Encoder = Encoder {
     data: critical_section::Mutex::new(RefCell::new(Data {
@@ -35,6 +39,7 @@ pub static ENCODER: Encoder = Encoder {
         running: false,
         sequence: 0,
         errors: 0,
+        configuration: None,
     })),
 };
 
@@ -69,6 +74,10 @@ impl Encoder {
         critical_section::with(|cs| self.data.borrow(cs).borrow_mut().running = running);
     }
 
+    pub fn snapshot(&self) -> Snapshot {
+        self.data().sample
+    }
+
     pub fn diagnostic(&self) -> (u32, u32, Option<u64>) {
         let data = self.data();
         (data.sequence, data.errors, data.sample.sampled_at)
@@ -78,13 +87,8 @@ impl Encoder {
         critical_section::with(|cs| *self.data.borrow(cs).borrow())
     }
 
-    fn record(&self, result: Result<Reading, Error>) {
+    fn record(&self, result: Result<Reading, &'static str>) {
         let now = Instant::now().duration_since_epoch().as_micros();
-        let result = result.map_err(|error| match error {
-            Error::AcknowledgeCheckFailed(_) => "nack",
-            Error::Timeout => "timeout",
-            _ => "i2c",
-        });
         critical_section::with(|cs| {
             let mut data = self.data.borrow(cs).borrow_mut();
             if result.is_ok() {
@@ -96,8 +100,14 @@ impl Encoder {
         });
     }
 
-    pub fn append_json(&self, out: &mut heapless::String<768>, now: u64) {
-        let data = self.data();
+    pub fn telemetry(&self) -> Telemetry {
+        Telemetry(self.data())
+    }
+}
+
+impl Telemetry {
+    pub fn append_json(&self, out: &mut heapless::String<1024>, now: u64) {
+        let data = self.0;
         let state = data.sample;
         let _ = write!(
             out,
@@ -105,8 +115,13 @@ impl Encoder {
             state.reading.is_some(),
             data.sequence,
             data.errors,
-            if data.running { 200 } else { 10 }
+            if data.running { 1000 } else { 10 }
         );
+        if let Some(configuration) = data.configuration {
+            let _ = write!(out, ",\"conf\":{}", configuration);
+        } else {
+            let _ = out.push_str(",\"conf\":null");
+        }
         if let Some(reading) = state.reading {
             let age = now.saturating_sub(state.sampled_at.unwrap_or(now)) / 1000;
             let valid = state
@@ -122,7 +137,11 @@ impl Encoder {
                 age
             );
             if valid {
-                let _ = write!(out, ",\"angle_deg\":{:.2}", reading.degrees());
+                let _ = write!(
+                    out,
+                    ",\"angle_deg\":{}",
+                    motor_control::decimal::Fixed::<2>(reading.degrees())
+                );
             } else {
                 let _ = out.push_str(",\"angle_deg\":null");
             }
@@ -136,34 +155,49 @@ impl Encoder {
 extern "C" fn worker_entry(param: *mut c_void) {
     // SAFETY: start() transferred this unique allocation to this task once.
     let Worker { bus, state } = *unsafe { Box::from_raw(param.cast::<Worker>()) };
-    // Async peripherals bind interrupts to the current core and are !Send.
-    // Transfer the Blocking peripheral, then convert inside its owning task.
-    let mut bus = bus.into_async();
+    // A short blocking transfer on this preemptible worker avoids repeated
+    // 100us RTOS sleeps/polls. Main can still preempt on the 1ms time slice.
+    let mut bus = bus;
     let thread = esp_rtos::CurrentThreadHandle::get();
-    let mut context = Context::from_waker(Waker::noop());
+    let mut realtime = false;
+    let mut original = None;
+    let mut profile = None;
     loop {
         let started = Instant::now();
         let was_running = state.data().running;
-        let result = {
-            let mut read = core::pin::pin!(read(&mut bus));
-            loop {
-                match read.as_mut().poll(&mut context) {
-                    Poll::Ready(result) => break result,
-                    // The peripheral works between polls. The RTOS sleeps this
-                    // lower-priority task, so it neither spins nor blocks control.
-                    Poll::Pending => thread.delay(Duration::from_micros(100)),
+        if was_running != realtime {
+            thread.set_priority(if was_running { ACTIVE_PRIORITY } else { 0 });
+            realtime = was_running;
+        }
+        if profile != Some(was_running) {
+            match configure(&mut bus, &mut original, was_running) {
+                Ok(configuration) => {
+                    critical_section::with(|cs| {
+                        state.data.borrow(cs).borrow_mut().configuration = Some(configuration)
+                    });
+                    profile = Some(was_running);
+                }
+                Err(error) => {
+                    critical_section::with(|cs| {
+                        state.data.borrow(cs).borrow_mut().configuration = None
+                    });
+                    state.record(Err(error));
+                    thread.delay(Duration::from_millis(1000));
+                    continue;
                 }
             }
-        };
+        }
+        let result = read(&mut bus).map_err(bus_error);
         let failed = result.is_err();
         state.record(result);
         if failed {
+            profile = None;
             // HAL timeout recovery can take up to 50ms on a stuck bus. It runs
             // only on this preemptible worker; back off to limit fault power.
             thread.delay(Duration::from_millis(1000));
             continue;
         }
-        let period = if was_running { 5_000 } else { 100_000 };
+        let period = if was_running { 1_000 } else { 100_000 };
         let deadline = started + Duration::from_micros(period);
         loop {
             let current = Instant::now();
@@ -176,11 +210,46 @@ extern "C" fn worker_entry(param: *mut c_void) {
     }
 }
 
-async fn read(bus: &mut I2c<'_, Async>) -> Result<Reading, Error> {
+fn bus_error(error: Error) -> &'static str {
+    match error {
+        Error::AcknowledgeCheckFailed(_) => "nack",
+        Error::Timeout => "timeout",
+        _ => "i2c",
+    }
+}
+
+fn configure(
+    bus: &mut I2c<'_, Blocking>,
+    original: &mut Option<u16>,
+    active: bool,
+) -> Result<u16, &'static str> {
+    let mut bytes = [0; 2];
+    bus.write_read(0x36u8, &[0x07], &mut bytes)
+        .map_err(bus_error)?;
+    let current = u16::from_be_bytes(bytes);
+    let saved = *original.get_or_insert(current);
+    let desired = if active {
+        feedback_configuration(saved)
+    } else {
+        saved
+    };
+    if current != desired {
+        let bytes = desired.to_be_bytes();
+        bus.write(0x36u8, &[0x07, bytes[0], bytes[1]])
+            .map_err(bus_error)?;
+    }
+    bus.write_read(0x36u8, &[0x07], &mut bytes)
+        .map_err(bus_error)?;
+    if u16::from_be_bytes(bytes) != desired {
+        return Err("config_verify");
+    }
+    Ok(desired)
+}
+
+fn read(bus: &mut I2c<'_, Blocking>) -> Result<Reading, Error> {
     // STATUS, RAW_ANGLE high, RAW_ANGLE low are consecutive. Starting at
     // STATUS uses normal address increment (datasheet I2C modes/register map).
     let mut registers = [0; 3];
-    bus.write_read_async(0x36u8, &[0x0b], &mut registers)
-        .await?;
+    bus.write_read(0x36u8, &[0x0b], &mut registers)?;
     Ok(Reading::decode(registers[0], [registers[1], registers[2]]))
 }
