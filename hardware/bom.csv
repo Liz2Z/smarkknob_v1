@@ -3,6 +3,3 @@ Controller,1,ESP32-C3 SuperMini,USB power; 4MB flash,User board documentation
 Motor driver,1,DRV8313 SimpleFOCMini / HW-974,12V bus; 3PWM; active-high EN,User driver documentation
 Motor,1,2804 hollow-shaft outer-rotor BLDC,7 pole pairs; nominal 12V; integrated diametric magnet,User factory motor documentation
 Encoder,1,AS5600 butterfly board,P1 I2C; 3.3V; mounted with motor,User factory encoder documentation
-Motor power,1,12V DC 3A supply,Motor driver power; shared ground with controller,User-confirmed project configuration
-Signal wires,1,Jumper wires / harness,See wiring.csv,Project wiring
-USB cable,1,USB data cable,Controller power and flashing,Project wiring
